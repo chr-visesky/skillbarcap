@@ -1,12 +1,9 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
-using Windows.Graphics;
-using Windows.Graphics.Capture;
-using Windows.Graphics.DirectX;
-using Windows.Graphics.DirectX.Direct3D11;
+using System.Drawing;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
 using Vortice.Mathematics;
@@ -17,15 +14,12 @@ namespace SkillbarCapture
     {
         private readonly ID3D11Device _device;
         private readonly ID3D11DeviceContext _context;
-        private readonly IDirect3DDevice _winrtDevice;
-        private readonly GraphicsCaptureItem _item;
+        private readonly IDXGIOutputDuplication _duplication;
+        private readonly Rectangle _windowRect;
+        private readonly OutputDescription _outputDesc;
         private readonly NormalizedRect _roi;
         private readonly int _sampleStride;
         private readonly string _outputFolder;
-
-        private Direct3D11CaptureFramePool _framePool;
-        private GraphicsCaptureSession _session;
-        private SizeInt32 _lastSize;
 
         private ID3D11Texture2D _roiTexture;
         private int _roiWidth;
@@ -38,19 +32,12 @@ namespace SkillbarCapture
         private TaskCompletionSource<bool> _tcs;
         private readonly object _lock = new object();
 
-        [ComImport]
-        [Guid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1")]
-        [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-        private interface IDirect3DDxgiInterfaceAccess
-        {
-            IntPtr GetInterface([In] ref Guid iid);
-        }
-
         public SkillbarCaptureSession(
             ID3D11Device device,
             ID3D11DeviceContext context,
-            IDirect3DDevice winrtDevice,
-            GraphicsCaptureItem item,
+            IDXGIOutputDuplication duplication,
+            Rectangle windowRect,
+            OutputDescription outputDesc,
             NormalizedRect roi,
             int sampleStride,
             string outputFolder)
@@ -59,8 +46,9 @@ namespace SkillbarCapture
 
             _device = device ?? throw new ArgumentNullException(nameof(device));
             _context = context ?? throw new ArgumentNullException(nameof(context));
-            _winrtDevice = winrtDevice ?? throw new ArgumentNullException(nameof(winrtDevice));
-            _item = item ?? throw new ArgumentNullException(nameof(item));
+            _duplication = duplication ?? throw new ArgumentNullException(nameof(duplication));
+            _windowRect = windowRect;
+            _outputDesc = outputDesc;
             _roi = roi;
             _sampleStride = sampleStride;
             _outputFolder = outputFolder ?? throw new ArgumentNullException(nameof(outputFolder));
@@ -76,92 +64,63 @@ namespace SkillbarCapture
             _running = true;
             _tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-            _lastSize = _item.Size;
-
-            _framePool = Direct3D11CaptureFramePool.Create(
-                _winrtDevice,
-                DirectXPixelFormat.B8G8R8A8UIntNormalized,
-                2,
-                _lastSize);
-
-            _framePool.FrameArrived += FramePool_FrameArrived;
-
-            _session = _framePool.CreateCaptureSession(_item);
-            _session.IsCursorCaptureEnabled = false;
-            _session.GetType().GetProperty("IsBorderRequired")?.SetValue(_session, false);
-
             cancellationToken.Register(Stop);
 
-            _session.StartCapture();
+            Task.Run(CaptureLoop);
 
             return _tcs.Task;
         }
 
-        private async void FramePool_FrameArrived(Direct3D11CaptureFramePool sender, object args)
+        private void CaptureLoop()
         {
-            if (!_running)
-                return;
-
-            Direct3D11CaptureFrame frame = null;
-
             try
             {
-                frame = sender.TryGetNextFrame();
-                if (frame == null)
-                    return;
+                var desktop = _outputDesc.DesktopCoordinates;
+                int outputLeft = desktop.Left;
+                int outputTop = desktop.Top;
+                int outputWidth = desktop.Right - desktop.Left;
+                int outputHeight = desktop.Bottom - desktop.Top;
 
-                // 甯ц鏁帮紝鐢ㄤ簬姣?N 甯ч噰鏍蜂竴娆?
-                int counter = Interlocked.Increment(ref _frameCounter);
-                if (counter % _sampleStride != 0)
+                int windowLeft = _windowRect.Left - outputLeft;
+                int windowTop = _windowRect.Top - outputTop;
+                int windowWidth = _windowRect.Width;
+                int windowHeight = _windowRect.Height;
+
+                while (_running)
                 {
-                    frame.Dispose();
-                    return;
-                }
+                    var result = _duplication.AcquireNextFrame(1000, out Vortice.DXGI.OutduplFrameInfo frameInfo, out IDXGIResource frameResource);
 
-                var contentSize = frame.ContentSize;
-                if (contentSize.Width != _lastSize.Width ||
-                    contentSize.Height != _lastSize.Height)
-                {
-                    _lastSize = contentSize;
-                    sender.Recreate(
-                        _winrtDevice,
-                        DirectXPixelFormat.B8G8R8A8UIntNormalized,
-                        2,
-                        _lastSize);
-
-                    DisposeRoiTexture();
-                    frame.Dispose();
-                    return;
-                }
-
-                using (frame)
-                {
-                    // 浠?WinRT Surface 鎷垮埌搴曞眰 ID3D11Texture2D
-                    var access = (IDirect3DDxgiInterfaceAccess)frame.Surface;
-                    Guid texGuid = new Guid("6f15aaf2-d208-4e89-9ab4-489535d34f9c"); // IID_ID3D11Texture2D
-                    IntPtr texPtr = access.GetInterface(ref texGuid);
-
-                    using (var fullTexture = new ID3D11Texture2D(texPtr))
+                    if (result == Vortice.DXGI.ResultCode.WaitTimeout)
                     {
-                        int fullWidth = _lastSize.Width;
-                        int fullHeight = _lastSize.Height;
+                        continue;
+                    }
 
-                        int roiLeft = (int)Math.Round(_roi.X * fullWidth);
-                        int roiTop = (int)Math.Round(_roi.Y * fullHeight);
-                        int roiWidth = (int)Math.Round(_roi.Width * fullWidth);
-                        int roiHeight = (int)Math.Round(_roi.Height * fullHeight);
+                    if (result.Failure || frameResource == null)
+                    {
+                        throw new InvalidOperationException("AcquireNextFrame failed: " + result.Code);
+                    }
+
+                    using (frameResource)
+                    using (var fullTexture = frameResource.QueryInterface<ID3D11Texture2D>())
+                    {
+                        int roiLeft = windowLeft + (int)Math.Round(_roi.X * windowWidth);
+                        int roiTop = windowTop + (int)Math.Round(_roi.Y * windowHeight);
+                        int roiWidth = (int)Math.Round(_roi.Width * windowWidth);
+                        int roiHeight = (int)Math.Round(_roi.Height * windowHeight);
 
                         if (roiLeft < 0) roiLeft = 0;
                         if (roiTop < 0) roiTop = 0;
-                        if (roiLeft + roiWidth > fullWidth) roiWidth = fullWidth - roiLeft;
-                        if (roiTop + roiHeight > fullHeight) roiHeight = fullHeight - roiTop;
+                        if (roiLeft + roiWidth > outputWidth) roiWidth = outputWidth - roiLeft;
+                        if (roiTop + roiHeight > outputHeight) roiHeight = outputHeight - roiTop;
 
                         if (roiWidth <= 0 || roiHeight <= 0)
-                            return;
+                        {
+                            _duplication.ReleaseFrame();
+                            continue;
+                        }
 
                         EnsureRoiTexture(roiWidth, roiHeight);
 
-                        // 鍦?GPU 鍐呰鍓?ROI 鍒?staging 绾圭悊
                         var box = new Box(
                             roiLeft,
                             roiTop,
@@ -176,12 +135,7 @@ namespace SkillbarCapture
                             fullTexture, 0,
                             box);
 
-                        // 浠?staging 绾圭悊璇诲洖 CPU
-                        var mapped = _context.Map(
-                            _roiTexture,
-                            0,
-                            MapMode.Read,
-                            Vortice.Direct3D11.MapFlags.None);
+                        var mapped = _context.Map(_roiTexture, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
 
                         try
                         {
@@ -218,10 +172,7 @@ namespace SkillbarCapture
                                 }
                             }
 
-                            string fileName = Path.Combine(
-                                _outputFolder,
-                                $"skillbar_{index:D4}.png");
-
+                            string fileName = Path.Combine(_outputFolder, $"skillbar_{index:D4}.png");
                             ImageIO.SavePng(roiBuffer, fileName);
 
                             if (finishNow)
@@ -233,6 +184,14 @@ namespace SkillbarCapture
                         {
                             _context.Unmap(_roiTexture, 0);
                         }
+                    }
+
+                    _duplication.ReleaseFrame();
+
+                    int counter = Interlocked.Increment(ref _frameCounter);
+                    if (!_running || counter % _sampleStride != 0)
+                    {
+                        continue;
                     }
                 }
             }
@@ -247,15 +206,13 @@ namespace SkillbarCapture
                     }
                 }
 
-                DisposeInternal();
+                Dispose();
             }
         }
 
         private void EnsureRoiTexture(int width, int height)
         {
-            if (_roiTexture != null &&
-                width == _roiWidth &&
-                height == _roiHeight)
+            if (_roiTexture != null && width == _roiWidth && height == _roiHeight)
             {
                 return;
             }
@@ -301,7 +258,7 @@ namespace SkillbarCapture
                     _tcs.TrySetResult(true);
             }
 
-            DisposeInternal();
+            Dispose();
         }
 
         public void Stop()
@@ -317,36 +274,12 @@ namespace SkillbarCapture
             Complete();
         }
 
-        private void DisposeInternal()
-        {
-            DisposeRoiTexture();
-
-            if (_session != null)
-            {
-                _session.Dispose();
-                _session = null;
-            }
-
-            if (_framePool != null)
-            {
-                _framePool.FrameArrived -= FramePool_FrameArrived;
-                _framePool.Dispose();
-                _framePool = null;
-            }
-        }
-
         public void Dispose()
         {
-            DisposeInternal();
-
+            DisposeRoiTexture();
+            _duplication?.Dispose();
             _context?.Dispose();
             _device?.Dispose();
-
-            if (_winrtDevice is IDisposable disposable)
-            {
-                disposable.Dispose();
-            }
         }
     }
 }
-

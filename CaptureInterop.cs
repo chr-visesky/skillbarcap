@@ -1,6 +1,8 @@
 using System;
+using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
-using Windows.Graphics.Capture;
+using System.Drawing;
 using Windows.Graphics.DirectX.Direct3D11;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
@@ -10,51 +12,53 @@ namespace SkillbarCapture
 {
     internal static class CaptureInterop
     {
-        // WinRT 工厂相关
-        [DllImport("combase.dll", CharSet = CharSet.Unicode)]
-        private static extern int WindowsCreateString(
-            string source,
-            int length,
-            out IntPtr hstring);
-
-        [DllImport("combase.dll")]
-        private static extern int WindowsDeleteString(IntPtr hstring);
-
-        [DllImport("combase.dll")]
-        private static extern int RoGetActivationFactory(
-            IntPtr hstring,
-            ref Guid iid,
-            out IntPtr factory);
-
         // DXGI -> WinRT 设备
         [DllImport("d3d11.dll", EntryPoint = "CreateDirect3D11DeviceFromDXGIDevice")]
-        private static extern int CreateDirect3D11DeviceFromDXGIDevice(
-            IntPtr dxgiDevice,
-            out IntPtr graphicsDevice);
+        private static extern int CreateDirect3D11DeviceFromDXGIDevice(IntPtr dxgiDevice, out IntPtr graphicsDevice);
 
-        // GraphicsCaptureItem 工厂接口
-        [ComImport]
-        [Guid("3628E81B-3CAC-4C60-B7F4-23CE0E0C3356")]
-        [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-        private interface IGraphicsCaptureItemInterop
+        // Win32 获取顶层窗口
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern int GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
+
+        private const uint GA_ROOT = 2;
+        private const uint GA_ROOTOWNER = 3;
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+        private const uint MONITOR_DEFAULTTONEAREST = 2;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
         {
-            int CreateForWindow(
-                IntPtr window,
-                [In] ref Guid iid,
-                [MarshalAs(UnmanagedType.IUnknown)] out object result);
-
-            int CreateForMonitor(
-                IntPtr monitor,
-                [In] ref Guid iid,
-                [MarshalAs(UnmanagedType.IUnknown)] out object result);
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
         }
 
-        public static void CreateD3DAndWinRTDevice(
+        public static void CreateD3DAndDuplicationForWindow(
+            IntPtr hwnd,
             out ID3D11Device d3dDevice,
             out ID3D11DeviceContext d3dContext,
-            out IDirect3DDevice winrtDevice)
+            out IDXGIOutputDuplication duplication,
+            out Rectangle windowRect,
+            out OutputDescription outputDesc)
         {
-            // 创建 D3D11 设备（Vortice 封装）
             var featureLevels = new[]
             {
                 FeatureLevel.Level_11_1,
@@ -75,44 +79,104 @@ namespace SkillbarCapture
             if (result.Failure)
                 throw new InvalidOperationException("D3D11CreateDevice failed: " + result.Code);
 
-            // 拿到 DXGI 设备指针
-            using (IDXGIDevice dxgiDevice = d3dDevice.QueryInterface<IDXGIDevice>())
-            {
-                IntPtr winrtDevicePtr;
-                int hr = CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.NativePointer, out winrtDevicePtr);
-                if (hr < 0)
-                    throw new InvalidOperationException("CreateDirect3D11DeviceFromDXGIDevice failed: 0x" + hr.ToString("X8"));
+            // 找到窗口所在的输出（显示器）
+            IntPtr monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            if (monitor == IntPtr.Zero)
+                throw new InvalidOperationException("MonitorFromWindow failed.");
 
-                winrtDevice = (IDirect3DDevice)Marshal.GetObjectForIUnknown(winrtDevicePtr);
-                Marshal.Release(winrtDevicePtr);
+            using (IDXGIDevice dxgiDevice = d3dDevice.QueryInterface<IDXGIDevice>())
+            using (IDXGIAdapter adapter = dxgiDevice.GetParent<IDXGIAdapter>())
+            using (IDXGIFactory1 factory = adapter.GetParent<IDXGIFactory1>())
+            {
+                IDXGIOutput1 targetOutput = null;
+                outputDesc = default;
+
+                uint adapterIndex = 0;
+                while (factory.EnumAdapters1(adapterIndex, out IDXGIAdapter1? enumAdapter).Success && enumAdapter != null)
+                {
+                    uint outputIndex = 0;
+                    while (enumAdapter.EnumOutputs(outputIndex, out IDXGIOutput? output).Success && output != null)
+                    {
+                        var output1 = output.QueryInterfaceOrNull<IDXGIOutput1>();
+                        if (output1 != null)
+                        {
+                            var desc = output1.Description;
+                            if (desc.Monitor == monitor)
+                            {
+                                targetOutput = output1;
+                                outputDesc = desc;
+                                output.Dispose();
+                                break;
+                            }
+                            output1.Dispose();
+                        }
+
+                        output.Dispose();
+                        outputIndex++;
+                    }
+
+                    if (targetOutput != null)
+                    {
+                        enumAdapter.Dispose();
+                        break;
+                    }
+
+                    enumAdapter.Dispose();
+                    adapterIndex++;
+                }
+
+                if (targetOutput == null)
+                    throw new InvalidOperationException("未找到对应显示器的 DXGI Output。");
+
+                duplication = targetOutput.DuplicateOutput(d3dDevice);
+                targetOutput.Dispose();
             }
+
+            if (!GetWindowRect(hwnd, out RECT rect))
+                throw new InvalidOperationException("GetWindowRect failed.");
+
+            windowRect = new Rectangle(rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top);
         }
 
-        public static GraphicsCaptureItem CreateItemForWindow(IntPtr hwnd)
+        public static IntPtr FindWindowByProcessName(string processName)
         {
-            string className = "Windows.Graphics.Capture.GraphicsCaptureItem";
-            IntPtr hstring;
-            int hr = WindowsCreateString(className, className.Length, out hstring);
-            if (hr < 0)
-                throw new InvalidOperationException("WindowsCreateString failed: 0x" + hr.ToString("X8"));
+            if (string.IsNullOrWhiteSpace(processName))
+                return IntPtr.Zero;
 
-            IntPtr factoryPtr;
-            Guid interopId = typeof(IGraphicsCaptureItemInterop).GUID;
-            hr = RoGetActivationFactory(hstring, ref interopId, out factoryPtr);
-            WindowsDeleteString(hstring);
+            string target = Path.GetFileNameWithoutExtension(processName).Trim();
+            IntPtr found = IntPtr.Zero;
 
-            if (hr < 0)
-                throw new InvalidOperationException("RoGetActivationFactory failed: 0x" + hr.ToString("X8"));
+            bool Callback(IntPtr hWnd, IntPtr lParam)
+            {
+                if (found != IntPtr.Zero)
+                    return false;
 
-            var interop = (IGraphicsCaptureItemInterop)Marshal.GetObjectForIUnknown(factoryPtr);
+                if (!IsWindowVisible(hWnd))
+                    return true;
 
-            Guid itemId = typeof(GraphicsCaptureItem).GUID;
-            object itemUnknown;
-            hr = interop.CreateForWindow(hwnd, ref itemId, out itemUnknown);
-            if (hr < 0)
-                throw new InvalidOperationException("CreateForWindow failed: 0x" + hr.ToString("X8"));
+                GetWindowThreadProcessId(hWnd, out uint pid);
+                if (pid == 0)
+                    return true;
 
-            return (GraphicsCaptureItem)itemUnknown;
+                try
+                {
+                    using var proc = Process.GetProcessById((int)pid);
+                    string name = Path.GetFileNameWithoutExtension(proc.ProcessName);
+                    if (string.Equals(name, target, StringComparison.OrdinalIgnoreCase))
+                    {
+                        found = hWnd;
+                        return false;
+                    }
+                }
+                catch
+                {
+                }
+
+                return true;
+            }
+
+            EnumWindows(Callback, IntPtr.Zero);
+            return found;
         }
     }
 }

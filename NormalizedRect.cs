@@ -15,8 +15,8 @@ namespace SkillbarCapture
             Height = height;
         }
 
-        // 这里先给一个大概位置：底部中间一条长条，你可以后面再微调
+        // 默认截取区域：底部中间的进度条（按截图位置预估，可再微调）
         public static NormalizedRect DefaultSkillbar =
-            new NormalizedRect(0.30, 0.86, 0.40, 0.07);
+            new NormalizedRect(0.39, 0.68, 0.24, 0.05);
     }
 }
