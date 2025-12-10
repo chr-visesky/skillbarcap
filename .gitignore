@@ -1,0 +1,28 @@
+# Build output
+bin/
+obj/
+
+# IDE metadata
+.vs/
+.idea/
+*.suo
+*.user
+*.userprefs
+*.sln.docstates
+
+# NuGet / packages
+*.nupkg
+*.snupkg
+
+# Diagnostics / traces
+*.log
+*.tmp
+*.dmp
+*.psess
+*.vsp
+*.vspx
+TestResult*/
+
+# Misc
+*.DS_Store
+*.Thumbs.db
