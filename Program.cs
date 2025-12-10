@@ -3,7 +3,6 @@ using System.Globalization;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
-using WinRT;
 
 namespace SkillbarCapture
 {
@@ -12,7 +11,6 @@ namespace SkillbarCapture
         [STAThread]
         private static void Main(string[] args)
         {
-            ComWrappersSupport.InitializeComWrappers();
             try
             {
                 RunAsync(args).GetAwaiter().GetResult();
@@ -25,14 +23,21 @@ namespace SkillbarCapture
 
         private static async Task RunAsync(string[] args)
         {
+            if (args.Length == 0)
+            {
+                PrintUsage();
+                return;
+            }
+
+            if (args[0].Equals("analyze", StringComparison.OrdinalIgnoreCase))
+            {
+                RunAnalyze(args);
+                return;
+            }
+
             if (args.Length < 2)
             {
-                Console.WriteLine("用法：");
-                Console.WriteLine("  SkillbarCapture.exe <hwnd_hex|process_name> <output_folder> [frameCount] [sampleStride]");
-                Console.WriteLine();
-                Console.WriteLine("示例：");
-                Console.WriteLine("  SkillbarCapture.exe 0000000001230042 C:\\Temp\\Skillbar 200 5");
-                Console.WriteLine("  SkillbarCapture.exe Gw2-64.exe C:\\Temp\\Skillbar 200 5");
+                PrintUsage();
                 return;
             }
 
@@ -57,13 +62,8 @@ namespace SkillbarCapture
 
             string outputFolder = args[1];
 
-            int frameCount = 200;
-            if (args.Length >= 3)
-                frameCount = int.Parse(args[2]);
-
-            int sampleStride = 5; // 每5帧采一帧
-            if (args.Length >= 4)
-                sampleStride = int.Parse(args[3]);
+            int frameCount = args.Length >= 3 ? int.Parse(args[2]) : 200;
+            int sampleStride = args.Length >= 4 ? int.Parse(args[3]) : 5; // 每 N 帧采一帧
 
             Directory.CreateDirectory(outputFolder);
 
@@ -88,11 +88,11 @@ namespace SkillbarCapture
                 sampleStride,
                 outputFolder))
             {
-                Console.WriteLine("Start capture...");
+                Console.WriteLine("开始截帧...");
                 Console.WriteLine("Window rect: L={0}, T={1}, W={2}, H={3}", windowRect.Left, windowRect.Top, windowRect.Width, windowRect.Height);
                 Console.WriteLine("ROI: X={0:F3}, Y={1:F3}, W={2:F3}, H={3:F3}", roi.X, roi.Y, roi.Width, roi.Height);
                 Console.WriteLine("FrameCount={0}, SampleStride={1}", frameCount, sampleStride);
-                Console.WriteLine("Press Enter to stop early.");
+                Console.WriteLine("按 Enter 可提前停止。");
 
                 var captureTask = session.RunAsync(frameCount, cts.Token);
 
@@ -105,10 +105,45 @@ namespace SkillbarCapture
                 await Task.WhenAny(captureTask, inputTask);
 
                 if (captureTask.IsFaulted)
-                    throw captureTask.Exception.InnerException;
+                    throw captureTask.Exception?.InnerException ?? captureTask.Exception;
 
-                Console.WriteLine("Capture finished.");
+                Console.WriteLine("截帧结束。");
             }
+        }
+
+        private static void RunAnalyze(string[] args)
+        {
+            if (args.Length < 2)
+            {
+                Console.WriteLine("用法（离线分析模式）：");
+                Console.WriteLine("  SkillbarCapture.exe analyze <folder>");
+                Console.WriteLine("  folder  : 帧所在目录，例如 Q:\\temp\\1");
+                return;
+            }
+
+            string folder = args[1];
+
+            if (!Directory.Exists(folder))
+            {
+                Console.WriteLine($"目录不存在：{folder}");
+                return;
+            }
+
+            PhaseAnalysis.AnalyzeWithTemplate(folder);
+        }
+
+        private static void PrintUsage()
+        {
+            Console.WriteLine("用法（实时截帧）：");
+            Console.WriteLine("  SkillbarCapture.exe <hwnd_hex|process_name> <output_folder> [frameCount] [sampleStride]");
+            Console.WriteLine("示例：");
+            Console.WriteLine("  SkillbarCapture.exe 0000000001230042 Q:\\Temp\\Skillbar 200 5");
+            Console.WriteLine("  SkillbarCapture.exe Gw2-64.exe Q:\\Temp\\Skillbar 200 5");
+            Console.WriteLine();
+            Console.WriteLine("用法（离线分析）：");
+            Console.WriteLine("  SkillbarCapture.exe analyze <folder>");
+            Console.WriteLine("示例：");
+            Console.WriteLine("  SkillbarCapture.exe analyze Q:\\temp\\1");
         }
     }
 }

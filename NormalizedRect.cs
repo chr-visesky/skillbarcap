@@ -15,8 +15,8 @@ namespace SkillbarCapture
             Height = height;
         }
 
-        // 默认截取区域：底部中间的进度条（按截图位置预估，可再微调）
+        // 默认截取区域（相对坐标）：居中偏下的技能条，约占窗口 24% 宽、5% 高
         public static NormalizedRect DefaultSkillbar =
-            new NormalizedRect(0.39, 0.68, 0.24, 0.05);
+            new NormalizedRect(0.415, 0.694, 0.171, 0.03);
     }
 }
