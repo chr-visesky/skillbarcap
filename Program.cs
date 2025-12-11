@@ -75,7 +75,8 @@ namespace SkillbarCapture
                 out var windowRect,
                 out var outputDesc);
 
-            var roi = NormalizedRect.DefaultSkillbar;
+            // 拟合技能条 ROI（包含标题栏；如需裁掉标题栏可将 removeTitleBar 置 true）
+            var roi = NormalizedRect.FitSkillbar(windowRect.Width, windowRect.Height, removeTitleBar: false, titleBarPixels: 37.0);
 
             using (var cts = new CancellationTokenSource())
             using (var session = new SkillbarCaptureSession(
