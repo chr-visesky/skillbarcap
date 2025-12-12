@@ -1,0 +1,218 @@
+代码设计思路 (Design Philosophy)预处理层 (Preprocessing)：优先解决环境干扰。利用方差检测自动切除 Windows 标题栏，确保坐标系建立在游戏视窗内部。几何公理 (Geometric Axioms)：中轴公理：UI 必须沿屏幕水平中轴对称 ($X = W/2$)。正圆公理：生命球必须是正圆，且高度 ($H$) 比宽度更难受边缘模糊影响，因此以高度定半径 ($R = H/2$)。数据拟合 (Data Fitting)：黄金系数 3.3：基于数据集推导，施法条中心距离生命球中心的垂直距离恒为 $3.3 \times R$。工程化落地 (Engineering)：使用 floor/ceil 策略进行保守取整，宁可多包 1 像素，不可漏包。
+
+import cv2
+import numpy as np
+import math
+
+class GuildWars2UIDetector:
+    """
+    基于几何约束与数据拟合的激战2 (Guild Wars 2) UI检测器。
+    
+    核心逻辑基于以下数据推导：
+    1. 中轴锁定：所有核心UI元素的中心X坐标恒等于屏幕宽度的一半。
+    2. 高度主导：在宽屏或拉伸窗口中，Y轴像素比X轴更可靠。
+    3. 比例系数：施法条位置与生命球半径(R)存在固定系数关系 (3.3)。
+    """
+
+    def __init__(self):
+        # --- 数据推导参数 (Derived Parameters) ---
+        
+        # [系数说明]
+        # 基于8组不同分辨率截图(904x190 ~ 2560x1440)的拟合结果：
+        # 施法条中心到生命球中心的垂直距离 / 生命球半径 ≈ 3.3
+        self.CAST_BAR_OFFSET_RATIO = 3.3 
+        
+        # 施法条宽度约为半径的 3.9 倍
+        self.CAST_BAR_WIDTH_RATIO = 3.9   
+        
+        # 施法条高度约为半径的 0.35 倍 (给予少量冗余空间)
+        self.CAST_BAR_HEIGHT_RATIO = 0.35 
+
+    def auto_strip_title_bar(self, img):
+        """
+        [预处理] 自动检测并切除 Windows 窗口标题栏。
+        原理：
+        1. 方差检测：标题栏通常为纯色（低方差），游戏画面杂色多（高方差）。
+        2. 梯度检测：寻找顶部区域中像素变化最剧烈的水平线。
+        """
+        if img is None: return img, 0
+        
+        # 截取顶部10像素进行采样
+        check_zone = img[0:10, :, :]
+        gray_zone = cv2.cvtColor(check_zone, cv2.COLOR_BGR2GRAY)
+        
+        # 计算标准差 (Standard Deviation)
+        # 如果 std < 10，说明顶部几乎是纯色的，极大概率是标题栏
+        std_dev = np.std(gray_zone)
+        
+        if std_dev > 10:
+            print("[系统] 顶部像素复杂 (std={:.2f})，判定为无标题栏全屏模式。".format(std_dev))
+            return img, 0
+
+        # 在顶部 0-60 像素范围内寻找边缘
+        search_h = 60
+        if img.shape[0] < search_h: return img, 0
+
+        top_slice = img[0:search_h, :, :]
+        gray_slice = cv2.cvtColor(top_slice, cv2.COLOR_BGR2GRAY)
+        
+        # 计算Y轴方向的梯度（相邻行像素差值的平均值）
+        # np.diff 用于计算离散差值
+        row_gradients = np.mean(np.abs(np.diff(gray_slice.astype(float), axis=0)), axis=1)
+        
+        # 找到梯度最大的行（即边缘分界线）
+        split_y = np.argmax(row_gradients)
+        
+        # 安全阈值检查：防止误切
+        # 1. 突变强度必须大于15
+        # 2. 高度必须在合理范围 (20px - 50px)
+        if row_gradients[split_y] > 15 and 20 < split_y < 50:
+            cut_y = split_y + 1 # +1 是因为 diff 导致索引偏移
+            print(f"[系统] 检测到窗口标题栏，执行裁剪。高度偏移: {cut_y}px")
+            return img[cut_y:, :], cut_y
+            
+        print("[系统] 未检测到明确的标题栏边缘，保持原图。")
+        return img, 0
+
+    def detect(self, image_path, output_path=None):
+        """
+        执行检测主流程
+        """
+        # 1. 读取图像
+        original_img = cv2.imread(image_path)
+        if original_img is None:
+            print(f"[错误] 无法找到文件: {image_path}")
+            return
+
+        # 2. 去除标题栏 (这对Y轴坐标的准确性至关重要)
+        img, title_offset = self.auto_strip_title_bar(original_img)
+        
+        H, W = img.shape[:2]
+        screen_center_x = W // 2  # [几何公理] 屏幕中轴
+
+        # ---------------------------------------------------------
+        # 第一阶段：锁定生命球 (Health Orb)
+        # ---------------------------------------------------------
+        
+        # 设定 ROI (感兴趣区域)：只在屏幕底部中间寻找，大幅减少误判
+        roi_y = int(H * 0.7)
+        roi_x = int(W * 0.3)
+        roi_img = img[roi_y:H, roi_x:int(W * 0.7)]
+        
+        # HSV 颜色识别 (红色)
+        hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
+        # 红色在HSV色轮上跨越了 0 和 180，所以需要两段 Mask
+        mask1 = cv2.inRange(hsv, np.array([0, 120, 70]), np.array([10, 255, 255]))
+        mask2 = cv2.inRange(hsv, np.array([170, 120, 70]), np.array([180, 255, 255]))
+        mask = mask1 + mask2
+        
+        # 形态学处理：膨胀 (Dilate) 填充红色区域内部空洞
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.dilate(mask, kernel, iterations=3)
+
+        # 寻找轮廓
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            print("[警告] 未检测到生命球，请检查图片是否包含 UI。")
+            return
+
+        # 取最大轮廓
+        largest_contour = max(contours, key=cv2.contourArea)
+        x_local, y_local, w_local, h_local = cv2.boundingRect(largest_contour)
+
+        # ---------------------------------------------------------
+        # 第二阶段：几何校正 (Geometric Correction)
+        # ---------------------------------------------------------
+
+        # [推导 1] 确定半径
+        # 我们信任高度(h)胜过宽度(w)，因为水平方向更容易受分辨率拉伸影响。
+        radius = h_local / 2.0
+
+        # [推导 2] 确定球心坐标
+        # Y轴：局部坐标 + ROI偏移 + 半径
+        orb_center_y_global = (y_local + roi_y) + radius
+        # X轴：强制使用屏幕中轴 (忽略识别出的 x_local，修正测量误差)
+        orb_center_x_global = screen_center_x
+
+        # 生成生命球的最终 Box (应用 floor/ceil 取整策略)
+        orb_box = [
+            math.floor(orb_center_x_global - radius), # x_min
+            math.floor(orb_center_y_global - radius), # y_min
+            math.ceil(orb_center_x_global + radius),  # x_max
+            math.ceil(orb_center_y_global + radius)   # y_max
+        ]
+
+        # ---------------------------------------------------------
+        # 第三阶段：施法条推测 (Cast Bar Prediction)
+        # ---------------------------------------------------------
+
+        # [推导 3] 利用系数推算施法条位置
+        # 公式：Cast_Y = Orb_Y - (3.3 * Radius)
+        cast_center_y = orb_center_y_global - (self.CAST_BAR_OFFSET_RATIO * radius)
+        
+        cast_w = self.CAST_BAR_WIDTH_RATIO * radius
+        cast_h = self.CAST_BAR_HEIGHT_RATIO * radius
+
+        # 生成施法条的最终 Box
+        cast_box = [
+            math.floor(screen_center_x - cast_w / 2), # x_min (强制中轴对齐)
+            math.floor(cast_center_y - cast_h / 2),   # y_min
+            math.ceil(screen_center_x + cast_w / 2),  # x_max
+            math.ceil(cast_center_y + cast_h / 2)     # y_max
+        ]
+
+        # ---------------------------------------------------------
+        # 第四阶段：可视化输出
+        # ---------------------------------------------------------
+        
+        # 绘制结果
+        # 绿色框：实际检测并校正后的生命球
+        cv2.rectangle(img, (orb_box[0], orb_box[1]), (orb_box[2], orb_box[3]), (0, 255, 0), 2)
+        cv2.putText(img, "Health Orb", (orb_box[0], orb_box[1]-10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        # 黄色框：算法推测出的施法条
+        cv2.rectangle(img, (cast_box[0], cast_box[1]), (cast_box[2], cast_box[3]), (0, 255, 255), 2)
+        cv2.putText(img, "Cast Bar (Pred)", (cast_box[0], cast_box[1]-10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        # 蓝色虚线：可视化中轴
+        cv2.line(img, (screen_center_x, cast_box[1]-50), (screen_center_x, orb_box[3]), (255, 0, 0), 1)
+
+        # 打印详细日志
+        print("-" * 30)
+        print(f"分辨率 (处理后): {W}x{H}")
+        print(f"生命球半径 (R): {radius:.2f} px")
+        print(f"中轴 X 坐标   : {screen_center_x}")
+        print("-" * 30)
+        print(f"生命球坐标 [x1, y1, x2, y2]:\n  {orb_box}")
+        print(f"施法条坐标 [x1, y1, x2, y2] (系数 3.3 推导):\n  {cast_box}")
+        print("-" * 30)
+
+        # 保存/显示
+        if output_path:
+            cv2.imwrite(output_path, img)
+            print(f"[完成] 结果已保存至: {output_path}")
+
+        # 缩放显示 (避免大图撑爆屏幕)
+        display_h = 800
+        if H > display_h:
+            scale = display_h / H
+            display_w = int(W * scale)
+            view_img = cv2.resize(img, (display_w, display_h))
+        else:
+            view_img = img
+            
+        cv2.imshow('GW2 UI Detector (Analysis)', view_img)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+# --- 运行入口 ---
+if __name__ == "__main__":
+    detector = GuildWars2UIDetector()
+    
+    # 在这里修改你的图片路径
+    target_image = "9.jpg" 
+    
+    print(f"正在分析: {target_image} ...")
+    detector.detect(target_image, "result_final.jpg")
