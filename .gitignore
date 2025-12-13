@@ -2,6 +2,9 @@
 bin/
 obj/
 
+# offline outputs
+castbar/
+
 # IDE metadata
 .vs/
 .idea/

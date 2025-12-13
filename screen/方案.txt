@@ -1,218 +1,381 @@
-代码设计思路 (Design Philosophy)预处理层 (Preprocessing)：优先解决环境干扰。利用方差检测自动切除 Windows 标题栏，确保坐标系建立在游戏视窗内部。几何公理 (Geometric Axioms)：中轴公理：UI 必须沿屏幕水平中轴对称 ($X = W/2$)。正圆公理：生命球必须是正圆，且高度 ($H$) 比宽度更难受边缘模糊影响，因此以高度定半径 ($R = H/2$)。数据拟合 (Data Fitting)：黄金系数 3.3：基于数据集推导，施法条中心距离生命球中心的垂直距离恒为 $3.3 \times R$。工程化落地 (Engineering)：使用 floor/ceil 策略进行保守取整，宁可多包 1 像素，不可漏包。
+特点：
+
+标题栏：双候选（0 / 自动检测值）打分选最优
+
+生命球：中轴竖向扫描 + 水平扫描做“正圆校验”（不圆就降权/剔除）
+
+矩形：统一半开区间（切图、坐标、绘制完全一致）
+
+取整：min 用 floor，max 用 ceil（按你要求偏大，不漏像素）
 
 import cv2
 import numpy as np
 import math
+from dataclasses import dataclass
+from typing import Optional, Tuple, Dict, Any, List
+
+
+@dataclass(frozen=True)
+class Rect:
+    # Half-open interval: [x1, x2), [y1, y2)
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+
+    def width(self) -> int:
+        return max(0, self.x2 - self.x1)
+
+    def height(self) -> int:
+        return max(0, self.y2 - self.y1)
+
+    def clamp(self, w: int, h: int) -> "Rect":
+        x1 = max(0, min(self.x1, w))
+        y1 = max(0, min(self.y1, h))
+        x2 = max(0, min(self.x2, w))
+        y2 = max(0, min(self.y2, h))
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if y2 < y1:
+            y1, y2 = y2, y1
+        if x2 == x1:
+            x2 = min(w, x1 + 1)
+        if y2 == y1:
+            y2 = min(h, y1 + 1)
+        return Rect(x1, y1, x2, y2)
+
+    def to_cv2_p1p2(self) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+        # cv2.rectangle uses inclusive points visually; convert half-open to inclusive end
+        p1 = (self.x1, self.y1)
+        p2 = (max(self.x1, self.x2 - 1), max(self.y1, self.y2 - 1))
+        return p1, p2
+
 
 class GuildWars2UIDetector:
-    """
-    基于几何约束与数据拟合的激战2 (Guild Wars 2) UI检测器。
-    
-    核心逻辑基于以下数据推导：
-    1. 中轴锁定：所有核心UI元素的中心X坐标恒等于屏幕宽度的一半。
-    2. 高度主导：在宽屏或拉伸窗口中，Y轴像素比X轴更可靠。
-    3. 比例系数：施法条位置与生命球半径(R)存在固定系数关系 (3.3)。
-    """
+    # Fitted from your labeled set (8 samples)
+    ORB_GAP_A = 0.29
+    ORB_GAP_B = 1.0
 
-    def __init__(self):
-        # --- 数据推导参数 (Derived Parameters) ---
-        
-        # [系数说明]
-        # 基于8组不同分辨率截图(904x190 ~ 2560x1440)的拟合结果：
-        # 施法条中心到生命球中心的垂直距离 / 生命球半径 ≈ 3.3
-        self.CAST_BAR_OFFSET_RATIO = 3.3 
-        
-        # 施法条宽度约为半径的 3.9 倍
-        self.CAST_BAR_WIDTH_RATIO = 3.9   
-        
-        # 施法条高度约为半径的 0.35 倍 (给予少量冗余空间)
-        self.CAST_BAR_HEIGHT_RATIO = 0.35 
+    CAST_W_RATIO = 3.85
+    CAST_TOP_FROM_ORB_BOTTOM_RATIO = 4.40
+    CAST_H_RATIO = 0.26
 
-    def auto_strip_title_bar(self, img):
-        """
-        [预处理] 自动检测并切除 Windows 窗口标题栏。
-        原理：
-        1. 方差检测：标题栏通常为纯色（低方差），游戏画面杂色多（高方差）。
-        2. 梯度检测：寻找顶部区域中像素变化最剧烈的水平线。
-        """
-        if img is None: return img, 0
-        
-        # 截取顶部10像素进行采样
-        check_zone = img[0:10, :, :]
-        gray_zone = cv2.cvtColor(check_zone, cv2.COLOR_BGR2GRAY)
-        
-        # 计算标准差 (Standard Deviation)
-        # 如果 std < 10，说明顶部几乎是纯色的，极大概率是标题栏
-        std_dev = np.std(gray_zone)
-        
-        if std_dev > 10:
-            print("[系统] 顶部像素复杂 (std={:.2f})，判定为无标题栏全屏模式。".format(std_dev))
-            return img, 0
+    def __init__(self) -> None:
+        pass
 
-        # 在顶部 0-60 像素范围内寻找边缘
-        search_h = 60
-        if img.shape[0] < search_h: return img, 0
+    @staticmethod
+    def _auto_detect_titlebar(img: np.ndarray) -> int:
+        h = img.shape[0]
+        if h < 60:
+            return 0
 
-        top_slice = img[0:search_h, :, :]
-        gray_slice = cv2.cvtColor(top_slice, cv2.COLOR_BGR2GRAY)
-        
-        # 计算Y轴方向的梯度（相邻行像素差值的平均值）
-        # np.diff 用于计算离散差值
-        row_gradients = np.mean(np.abs(np.diff(gray_slice.astype(float), axis=0)), axis=1)
-        
-        # 找到梯度最大的行（即边缘分界线）
-        split_y = np.argmax(row_gradients)
-        
-        # 安全阈值检查：防止误切
-        # 1. 突变强度必须大于15
-        # 2. 高度必须在合理范围 (20px - 50px)
-        if row_gradients[split_y] > 15 and 20 < split_y < 50:
-            cut_y = split_y + 1 # +1 是因为 diff 导致索引偏移
-            print(f"[系统] 检测到窗口标题栏，执行裁剪。高度偏移: {cut_y}px")
-            return img[cut_y:, :], cut_y
-            
-        print("[系统] 未检测到明确的标题栏边缘，保持原图。")
-        return img, 0
+        check = img[0:10, :, :]
+        if check.size == 0:
+            return 0
+        gray = cv2.cvtColor(check, cv2.COLOR_BGR2GRAY)
+        std = float(np.std(gray))
 
-    def detect(self, image_path, output_path=None):
-        """
-        执行检测主流程
-        """
-        # 1. 读取图像
-        original_img = cv2.imread(image_path)
-        if original_img is None:
-            print(f"[错误] 无法找到文件: {image_path}")
-            return
+        # If top is complex, likely no titlebar (fullscreen), but can be false.
+        # We still return a candidate (0) and let scoring decide.
+        if std > 10.0:
+            return 0
 
-        # 2. 去除标题栏 (这对Y轴坐标的准确性至关重要)
-        img, title_offset = self.auto_strip_title_bar(original_img)
-        
+        search_h = min(60, h)
+        top = img[0:search_h, :, :]
+        g = cv2.cvtColor(top, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+        # Row gradients
+        grad = np.mean(np.abs(np.diff(g, axis=0)), axis=1)
+        split = int(np.argmax(grad))
+
+        # Reasonable band for Windows titlebar-ish area
+        if grad[split] > 15.0 and 15 < split < 55:
+            return split + 1
+        return 0
+
+    @staticmethod
+    def _redness_score_line(bgr: np.ndarray, x: int) -> np.ndarray:
+        H, W = bgr.shape[:2]
+        xs = [max(0, min(x + dx, W - 1)) for dx in (-1, 0, 1)]
+        b = bgr[:, xs, 0].astype(np.int16)
+        g = bgr[:, xs, 1].astype(np.int16)
+        r = bgr[:, xs, 2].astype(np.int16)
+        m = np.maximum(b, g)
+        s = np.clip(r - m, 0, 255)
+        return s.mean(axis=1).astype(np.float32)
+
+    @staticmethod
+    def _redness_score_row(bgr: np.ndarray, y: int) -> np.ndarray:
+        H, W = bgr.shape[:2]
+        ys = [max(0, min(y + dy, H - 1)) for dy in (-1, 0, 1)]
+        b = bgr[ys, :, 0].astype(np.int16)
+        g = bgr[ys, :, 1].astype(np.int16)
+        r = bgr[ys, :, 2].astype(np.int16)
+        m = np.maximum(b, g)
+        s = np.clip(r - m, 0, 255)
+        return s.mean(axis=0).astype(np.float32)
+
+    @staticmethod
+    def _find_best_run_1d(score: np.ndarray, start: int, end: int,
+                         min_len: int, max_len: int) -> Optional[Tuple[int, int, float]]:
+        win = score[start:end]
+        if win.size == 0:
+            return None
+        p90 = float(np.percentile(win, 90))
+        thr = max(20.0, 0.5 * p90)
+
+        mask = (score > thr).astype(np.uint8)
+        mask[:start] = 0
+        mask[end:] = 0
+
+        best = None
+        best_score = None
+
+        i = start
+        while i < end:
+            if mask[i] == 0:
+                i += 1
+                continue
+            j = i
+            while j < end and mask[j] == 1:
+                j += 1
+            top = i
+            bot = j - 1
+            length = bot - top + 1
+            if length < min_len or length > max_len:
+                i = j
+                continue
+
+            s = float(score[top:bot + 1].sum())
+            if best_score is None or s > best_score:
+                best_score = s
+                best = (top, bot, s)
+            i = j
+
+        return best
+
+    def _detect_orb_client(self, client: np.ndarray) -> Optional[Dict[str, Any]]:
+        Hc, W = client.shape[:2]
+        cx = W / 2.0
+        x = int(round(cx))
+
+        score_v = self._redness_score_line(client, x)
+        score_v = np.convolve(score_v, np.array([0.25, 0.5, 0.25], dtype=np.float32), mode="same")
+
+        y_min = int(Hc * 0.45)
+        y_max = Hc
+
+        min_len = int(max(6, round(0.05 * Hc)))
+        max_len = int(max(min_len + 2, round(0.25 * Hc)))
+
+        run = self._find_best_run_1d(score_v, y_min, y_max, min_len, max_len)
+        if run is None:
+            return None
+
+        top, bottom, v_sum = run
+        Rv_raw = (bottom - top) / 2.0
+        cy_raw = (top + bottom) / 2.0
+
+        # Horizontal circle check near cy_raw
+        y = int(round(cy_raw))
+        score_h = self._redness_score_row(client, y)
+        score_h = np.convolve(score_h, np.array([0.25, 0.5, 0.25], dtype=np.float32), mode="same")
+
+        x_min = int(W * 0.20)
+        x_max = int(W * 0.80)
+
+        min_len_h = int(max(6, round(0.05 * Hc)))
+        max_len_h = int(max(min_len_h + 2, round(0.30 * Hc)))
+
+        run_h = self._find_best_run_1d(score_h, x_min, x_max, min_len_h, max_len_h)
+        if run_h is None:
+            return None
+
+        left, right, h_sum = run_h
+        Rh_raw = (right - left) / 2.0
+        cx_h = (left + right) / 2.0
+
+        # Enforce midline axiom: orb center x == W/2, but use Rh as a circle sanity check
+        if Rv_raw <= 0.0 or Rh_raw <= 0.0:
+            return None
+
+        # Circle tolerance: horizontal/vertical radius should be close
+        ratio = Rh_raw / Rv_raw
+        if ratio < 0.80 or ratio > 1.25:
+            return None
+
+        # Make radius "regular": integer pixels
+        R = float(max(1, int(round((Rv_raw + Rh_raw) / 2.0))))
+
+        # Use bottom gap model to stabilize orb bottom
+        gap = self.ORB_GAP_A * R + self.ORB_GAP_B
+        orb_bottom = Hc - gap
+        orb_cy = orb_bottom - R
+
+        return {
+            "W": W,
+            "H": Hc,
+            "cx": W / 2.0,
+            "R": R,
+            "gap": gap,
+            "orb_bottom": orb_bottom,
+            "orb_cy": orb_cy,
+            "raw": {
+                "top": top, "bottom": bottom, "Rv_raw": Rv_raw, "cy_raw": cy_raw, "v_sum": v_sum,
+                "left": left, "right": right, "Rh_raw": Rh_raw, "cx_h": cx_h, "h_sum": h_sum,
+                "ratio": ratio,
+            }
+        }
+
+    def _compute_boxes_from_orb(self, orb: Dict[str, Any], yoff: int, img_w: int, img_h: int) -> Tuple[Rect, Rect]:
+        cx = float(orb["cx"])
+        R = float(orb["R"])
+        orb_cy_img = float(orb["orb_cy"]) + float(yoff)
+        orb_bottom_client = float(orb["orb_bottom"])
+
+        cast_w = self.CAST_W_RATIO * R
+        cast_h = self.CAST_H_RATIO * R
+        cast_top_client = orb_bottom_client - self.CAST_TOP_FROM_ORB_BOTTOM_RATIO * R
+        cast_top_img = cast_top_client + yoff
+
+        # Half-open: mins floor, maxs ceil
+        cast = Rect(
+            int(math.floor(cx - cast_w / 2.0)),
+            int(math.floor(cast_top_img)),
+            int(math.ceil(cx + cast_w / 2.0)),
+            int(math.ceil(cast_top_img + cast_h)),
+        ).clamp(img_w, img_h)
+
+        orb_box = Rect(
+            int(math.floor(cx - R)),
+            int(math.floor(orb_cy_img - R)),
+            int(math.ceil(cx + R)),
+            int(math.ceil(orb_cy_img + R)),
+        ).clamp(img_w, img_h)
+
+        return orb_box, cast
+
+    def detect(self, image_path: str, overlay_out: Optional[str] = None,
+               crop_orb_out: Optional[str] = None, crop_cast_out: Optional[str] = None) -> Dict[str, Any]:
+        img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        if img is None:
+            raise RuntimeError("cannot read image: " + str(image_path))
+
         H, W = img.shape[:2]
-        screen_center_x = W // 2  # [几何公理] 屏幕中轴
 
-        # ---------------------------------------------------------
-        # 第一阶段：锁定生命球 (Health Orb)
-        # ---------------------------------------------------------
-        
-        # 设定 ROI (感兴趣区域)：只在屏幕底部中间寻找，大幅减少误判
-        roi_y = int(H * 0.7)
-        roi_x = int(W * 0.3)
-        roi_img = img[roi_y:H, roi_x:int(W * 0.7)]
-        
-        # HSV 颜色识别 (红色)
-        hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
-        # 红色在HSV色轮上跨越了 0 和 180，所以需要两段 Mask
-        mask1 = cv2.inRange(hsv, np.array([0, 120, 70]), np.array([10, 255, 255]))
-        mask2 = cv2.inRange(hsv, np.array([170, 120, 70]), np.array([180, 255, 255]))
-        mask = mask1 + mask2
-        
-        # 形态学处理：膨胀 (Dilate) 填充红色区域内部空洞
-        kernel = np.ones((3, 3), np.uint8)
-        mask = cv2.dilate(mask, kernel, iterations=3)
+        yoff_auto = self._auto_detect_titlebar(img)
+        candidates: List[int] = []
+        candidates.append(0)
+        if yoff_auto not in candidates:
+            candidates.append(yoff_auto)
 
-        # 寻找轮廓
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            print("[警告] 未检测到生命球，请检查图片是否包含 UI。")
-            return
+        best = None
+        best_score = None
 
-        # 取最大轮廓
-        largest_contour = max(contours, key=cv2.contourArea)
-        x_local, y_local, w_local, h_local = cv2.boundingRect(largest_contour)
+        for yoff in candidates:
+            client = img[yoff:, :, :]
+            orb = self._detect_orb_client(client)
+            if orb is None:
+                continue
 
-        # ---------------------------------------------------------
-        # 第二阶段：几何校正 (Geometric Correction)
-        # ---------------------------------------------------------
+            # Score: prefer orb close to bottom, and good circle ratio
+            gap = float(orb["gap"])
+            R = float(orb["R"])
+            ratio = float(orb["raw"]["ratio"])
+            orb_bottom = float(orb["orb_bottom"])
+            Hc = float(orb["H"])
 
-        # [推导 1] 确定半径
-        # 我们信任高度(h)胜过宽度(w)，因为水平方向更容易受分辨率拉伸影响。
-        radius = h_local / 2.0
+            # orb_bottom should be near Hc (because gap is small)
+            bottomness = 1.0 - abs((Hc - orb_bottom) - gap) / max(1.0, Hc)
+            circle = 1.0 - abs(1.0 - ratio)
+            score = 1000.0 * bottomness + 200.0 * circle + 0.5 * (orb["raw"]["v_sum"] + orb["raw"]["h_sum"])
 
-        # [推导 2] 确定球心坐标
-        # Y轴：局部坐标 + ROI偏移 + 半径
-        orb_center_y_global = (y_local + roi_y) + radius
-        # X轴：强制使用屏幕中轴 (忽略识别出的 x_local，修正测量误差)
-        orb_center_x_global = screen_center_x
+            if best_score is None or score > best_score:
+                best_score = score
+                best = (yoff, orb)
 
-        # 生成生命球的最终 Box (应用 floor/ceil 取整策略)
-        orb_box = [
-            math.floor(orb_center_x_global - radius), # x_min
-            math.floor(orb_center_y_global - radius), # y_min
-            math.ceil(orb_center_x_global + radius),  # x_max
-            math.ceil(orb_center_y_global + radius)   # y_max
-        ]
+        if best is None:
+            raise RuntimeError("orb not found under any titlebar hypothesis")
 
-        # ---------------------------------------------------------
-        # 第三阶段：施法条推测 (Cast Bar Prediction)
-        # ---------------------------------------------------------
+        yoff, orb = best
+        orb_box, cast_box = self._compute_boxes_from_orb(orb, yoff, W, H)
 
-        # [推导 3] 利用系数推算施法条位置
-        # 公式：Cast_Y = Orb_Y - (3.3 * Radius)
-        cast_center_y = orb_center_y_global - (self.CAST_BAR_OFFSET_RATIO * radius)
-        
-        cast_w = self.CAST_BAR_WIDTH_RATIO * radius
-        cast_h = self.CAST_BAR_HEIGHT_RATIO * radius
+        result: Dict[str, Any] = {
+            "titlebar_offset": int(yoff),
+            "orb_box": (orb_box.x1, orb_box.y1, orb_box.x2, orb_box.y2),
+            "cast_box": (cast_box.x1, cast_box.y1, cast_box.x2, cast_box.y2),
+            "orb_radius": float(orb["R"]),
+            "debug": {
+                "yoff_candidates": candidates,
+                "chosen_yoff": int(yoff),
+                "raw": orb["raw"],
+            }
+        }
 
-        # 生成施法条的最终 Box
-        cast_box = [
-            math.floor(screen_center_x - cast_w / 2), # x_min (强制中轴对齐)
-            math.floor(cast_center_y - cast_h / 2),   # y_min
-            math.ceil(screen_center_x + cast_w / 2),  # x_max
-            math.ceil(cast_center_y + cast_h / 2)     # y_max
-        ]
+        if overlay_out is not None or crop_orb_out is not None or crop_cast_out is not None:
+            vis = img.copy()
 
-        # ---------------------------------------------------------
-        # 第四阶段：可视化输出
-        # ---------------------------------------------------------
-        
-        # 绘制结果
-        # 绿色框：实际检测并校正后的生命球
-        cv2.rectangle(img, (orb_box[0], orb_box[1]), (orb_box[2], orb_box[3]), (0, 255, 0), 2)
-        cv2.putText(img, "Health Orb", (orb_box[0], orb_box[1]-10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            # midline
+            cv2.line(vis, (W // 2, 0), (W // 2, H - 1), (255, 255, 0), 1)
+            if yoff > 0:
+                cv2.line(vis, (0, yoff), (W - 1, yoff), (255, 0, 255), 1)
 
-        # 黄色框：算法推测出的施法条
-        cv2.rectangle(img, (cast_box[0], cast_box[1]), (cast_box[2], cast_box[3]), (0, 255, 255), 2)
-        cv2.putText(img, "Cast Bar (Pred)", (cast_box[0], cast_box[1]-10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            p1, p2 = orb_box.to_cv2_p1p2()
+            cv2.rectangle(vis, p1, p2, (0, 255, 0), 2)
 
-        # 蓝色虚线：可视化中轴
-        cv2.line(img, (screen_center_x, cast_box[1]-50), (screen_center_x, orb_box[3]), (255, 0, 0), 1)
+            p1, p2 = cast_box.to_cv2_p1p2()
+            cv2.rectangle(vis, p1, p2, (0, 255, 255), 2)
 
-        # 打印详细日志
-        print("-" * 30)
-        print(f"分辨率 (处理后): {W}x{H}")
-        print(f"生命球半径 (R): {radius:.2f} px")
-        print(f"中轴 X 坐标   : {screen_center_x}")
-        print("-" * 30)
-        print(f"生命球坐标 [x1, y1, x2, y2]:\n  {orb_box}")
-        print(f"施法条坐标 [x1, y1, x2, y2] (系数 3.3 推导):\n  {cast_box}")
-        print("-" * 30)
+            if overlay_out is not None:
+                cv2.imwrite(overlay_out, vis)
 
-        # 保存/显示
-        if output_path:
-            cv2.imwrite(output_path, img)
-            print(f"[完成] 结果已保存至: {output_path}")
+            if crop_orb_out is not None:
+                crop = img[orb_box.y1:orb_box.y2, orb_box.x1:orb_box.x2].copy()
+                cv2.imwrite(crop_orb_out, crop)
 
-        # 缩放显示 (避免大图撑爆屏幕)
-        display_h = 800
-        if H > display_h:
-            scale = display_h / H
-            display_w = int(W * scale)
-            view_img = cv2.resize(img, (display_w, display_h))
-        else:
-            view_img = img
-            
-        cv2.imshow('GW2 UI Detector (Analysis)', view_img)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
+            if crop_cast_out is not None:
+                crop = img[cast_box.y1:cast_box.y2, cast_box.x1:cast_box.x2].copy()
+                cv2.imwrite(crop_cast_out, crop)
 
-# --- 运行入口 ---
+        return result
+
+
+def main() -> None:
+    det = GuildWars2UIDetector()
+    image_path = "8.png"
+
+    r = det.detect(
+        image_path,
+        overlay_out="8_overlay_fused.png",
+        crop_orb_out="8_orb_fused.png",
+        crop_cast_out="8_cast_fused.png",
+    )
+
+    print("titlebar_offset =", r["titlebar_offset"])
+    print("orb_box =", r["orb_box"])
+    print("cast_box =", r["cast_box"])
+    print("orb_radius =", r["orb_radius"])
+
+
 if __name__ == "__main__":
-    detector = GuildWars2UIDetector()
-    
-    # 在这里修改你的图片路径
-    target_image = "9.jpg" 
-    
-    print(f"正在分析: {target_image} ...")
-    detector.detect(target_image, "result_final.jpg")
+    main()
+
+
+ID,分辨率 (W×H),中轴 X,"施法条 (Cast Bar) 校正坐标  [xmin​,ymin​,xmax​,ymax​]","生命球 (Health Orb) 校正坐标  [xmin​,ymin​,xmax​,ymax​]",备注
+1,992×661,496,"[418,469,574,478]","[454,565,538,649]",标准
+2,622×661,311,"[252,517,370,524]","[280,589,342,651]",已修正X轴偏移
+3,1628×661,814,"[736,469,892,478]","[772,565,856,649]",宽屏
+4,1628×951,814,"[716,713,912,726]","[763,834,865,936]",高UI缩放
+5,2560×1440,1280,"[1183,1203,1377,1216]","[1229,1324,1331,1426]",2K分辨率
+6,538×420,269,"[222,302,316,307]","[243,361,295,413]",小窗口
+7,538×1002,269,"[218,878,320,883]","[242,940,296,994]",竖屏
+8,904×190,452,"[433,142,471,144]","[441,165,463,187]",扁平窗口
+
+1（992×661）y-37标题：施法条：418，469   574，478。红圈：496，566   496，648   454，607  537，607
+2（622×661）y-37标题：施法条：252，517   369，524。红圈：331，589   331，651   280，620  341，620
+3（1628×661）y-37标题：施法条：735，469   890，478。红圈：814，566   814，648   772，607  854，607
+4（1628×951）y-37标题：施法条：717，713   910，726。红圈：814，834   814，935   763，885  864，885
+5（2560×1440）：施法条：1184，1203   1379，1216。红圈：1280，1324   1280，1425   1229，1375  1330，1375
+6（538×420）y-37标题：施法条：222，302   315，307。红圈：269，361   269，412   243，386  294，386
+7（538×1002）y-37标题：施法条：218，878   317，883。红圈：269，940   269，993   242，966  296，966
+8（904×190）y-37标题：：施法条：433，142   470，144。红圈：452，166   452，186   441，175  462，175

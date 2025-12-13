@@ -17,9 +17,10 @@ namespace SkillbarCapture
         private readonly IDXGIOutputDuplication _duplication;
         private readonly Rectangle _windowRect;
         private readonly OutputDescription _outputDesc;
-        private readonly NormalizedRect _roi;
+        private readonly Rectangle _roiPixels;
         private readonly int _sampleStride;
         private readonly string _outputFolder;
+        private readonly string _filePrefix;
 
         private ID3D11Texture2D _roiTexture;
         private int _roiWidth;
@@ -38,20 +39,25 @@ namespace SkillbarCapture
             IDXGIOutputDuplication duplication,
             Rectangle windowRect,
             OutputDescription outputDesc,
-            NormalizedRect roi,
+            Rectangle roiPixels,
             int sampleStride,
-            string outputFolder)
+            string outputFolder,
+            string filePrefix)
         {
             if (sampleStride <= 0) throw new ArgumentOutOfRangeException(nameof(sampleStride));
+            if (string.IsNullOrWhiteSpace(filePrefix)) throw new ArgumentException("File prefix cannot be empty.", nameof(filePrefix));
+            if (roiPixels.Width <= 0 || roiPixels.Height <= 0)
+                throw new ArgumentOutOfRangeException(nameof(roiPixels), "ROI must have positive size.");
 
             _device = device ?? throw new ArgumentNullException(nameof(device));
             _context = context ?? throw new ArgumentNullException(nameof(context));
             _duplication = duplication ?? throw new ArgumentNullException(nameof(duplication));
             _windowRect = windowRect;
             _outputDesc = outputDesc;
-            _roi = roi;
+            _roiPixels = roiPixels;
             _sampleStride = sampleStride;
             _outputFolder = outputFolder ?? throw new ArgumentNullException(nameof(outputFolder));
+            _filePrefix = filePrefix;
         }
 
         public Task RunAsync(int frameCount, CancellationToken cancellationToken)
@@ -83,8 +89,24 @@ namespace SkillbarCapture
 
                 int windowLeft = _windowRect.Left - outputLeft;
                 int windowTop = _windowRect.Top - outputTop;
-                int windowWidth = _windowRect.Width;
-                int windowHeight = _windowRect.Height;
+
+                int roiLeft = windowLeft + _roiPixels.Left;
+                int roiTop = windowTop + _roiPixels.Top;
+                int roiRight = roiLeft + _roiPixels.Width;
+                int roiBottom = roiTop + _roiPixels.Height;
+
+                if (roiLeft < 0) roiLeft = 0;
+                if (roiTop < 0) roiTop = 0;
+                if (roiRight > outputWidth) roiRight = outputWidth;
+                if (roiBottom > outputHeight) roiBottom = outputHeight;
+
+                int roiWidth = roiRight - roiLeft;
+                int roiHeight = roiBottom - roiTop;
+
+                if (roiWidth <= 0 || roiHeight <= 0)
+                    throw new InvalidOperationException("ROI is outside of output bounds.");
+
+                EnsureRoiTexture(roiWidth, roiHeight);
 
                 while (_running)
                 {
@@ -100,27 +122,17 @@ namespace SkillbarCapture
                         throw new InvalidOperationException("AcquireNextFrame failed: " + result.Code);
                     }
 
+                    int counter = Interlocked.Increment(ref _frameCounter);
+                    if (!_running || counter % _sampleStride != 0)
+                    {
+                        frameResource.Dispose();
+                        _duplication.ReleaseFrame();
+                        continue;
+                    }
+
                     using (frameResource)
                     using (var fullTexture = frameResource.QueryInterface<ID3D11Texture2D>())
                     {
-                        int roiLeft = windowLeft + (int)Math.Round(_roi.X * windowWidth);
-                        int roiTop = windowTop + (int)Math.Round(_roi.Y * windowHeight);
-                        int roiWidth = (int)Math.Round(_roi.Width * windowWidth);
-                        int roiHeight = (int)Math.Round(_roi.Height * windowHeight);
-
-                        if (roiLeft < 0) roiLeft = 0;
-                        if (roiTop < 0) roiTop = 0;
-                        if (roiLeft + roiWidth > outputWidth) roiWidth = outputWidth - roiLeft;
-                        if (roiTop + roiHeight > outputHeight) roiHeight = outputHeight - roiTop;
-
-                        if (roiWidth <= 0 || roiHeight <= 0)
-                        {
-                            _duplication.ReleaseFrame();
-                            continue;
-                        }
-
-                        EnsureRoiTexture(roiWidth, roiHeight);
-
                         var box = new Box(
                             roiLeft,
                             roiTop,
@@ -172,7 +184,7 @@ namespace SkillbarCapture
                                 }
                             }
 
-                            string fileName = Path.Combine(_outputFolder, $"skillbar_{index:D4}.png");
+                            string fileName = Path.Combine(_outputFolder, $"{_filePrefix}_{index:D4}.png");
                             ImageIO.SavePng(roiBuffer, fileName);
 
                             if (finishNow)
@@ -187,12 +199,6 @@ namespace SkillbarCapture
                     }
 
                     _duplication.ReleaseFrame();
-
-                    int counter = Interlocked.Increment(ref _frameCounter);
-                    if (!_running || counter % _sampleStride != 0)
-                    {
-                        continue;
-                    }
                 }
             }
             catch (Exception ex)
