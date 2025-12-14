@@ -3,6 +3,8 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
+using Castbar;
+using OpenCvSharp;
 
 namespace SkillbarCapture
 {
@@ -15,7 +17,7 @@ namespace SkillbarCapture
 
             if (!Directory.Exists(inputFolder))
             {
-                Console.WriteLine($"目录不存在：{inputFolder}");
+                Console.WriteLine($"Input folder not found: {inputFolder}");
                 return;
             }
 
@@ -26,12 +28,12 @@ namespace SkillbarCapture
 
             if (files.Length == 0)
             {
-                Console.WriteLine("目录下没有 png 文件。");
+                Console.WriteLine("No png files in the input folder.");
                 return;
             }
 
-            Console.WriteLine($"输入目录：{inputFolder}");
-            Console.WriteLine($"输出目录：{outputFolder}");
+            Console.WriteLine($"Input folder: {inputFolder}");
+            Console.WriteLine($"Output folder: {outputFolder}");
 
             foreach (var path in files)
             {
@@ -89,6 +91,92 @@ namespace SkillbarCapture
                     orbRect.Width,
                     orbRect.Height,
                     cvR);
+            }
+        }
+
+        public static void RunAnalyzeCastbarPhase(string[] args)
+        {
+            string inputFolder = args.Length >= 2 ? args[1] : Path.Combine(Directory.GetCurrentDirectory(), "castbar");
+            string? configPath = args.Length >= 3 ? args[2] : null;
+
+            if (!Directory.Exists(inputFolder))
+            {
+                Console.WriteLine($"Input folder not found: {inputFolder}");
+                return;
+            }
+
+            var files = Directory.GetFiles(inputFolder, "*.png", SearchOption.TopDirectoryOnly);
+            Array.Sort(files, StringComparer.Ordinal);
+
+            if (files.Length == 0)
+            {
+                Console.WriteLine("No png files in the input folder.");
+                return;
+            }
+
+            CastbarPhaseConfig cfg = (configPath != null && File.Exists(configPath))
+                ? CastbarPhaseConfig.FromJson(configPath)
+                : new CastbarPhaseConfig();
+
+            using var detector = new CastbarPhaseDetector(cfg);
+
+            CastbarStage? lastStage = null;
+            TurnoutLevel? lastTurnout = null;
+            CastbarPhaseResult lastResult = default;
+            bool hasResult = false;
+
+            Console.WriteLine($"Input folder: {inputFolder}");
+            if (configPath != null)
+                Console.WriteLine($"Config: {configPath}");
+
+            for (int i = 0; i < files.Length; i++)
+            {
+                var path = files[i];
+
+                using var mat = Cv2.ImRead(path, ImreadModes.Unchanged);
+                if (mat.Empty())
+                {
+                    Console.WriteLine($"{Path.GetFileName(path)}: empty image, skip");
+                    continue;
+                }
+
+                var result = detector.Analyze(mat);
+
+                Console.WriteLine(
+                    "{0:D4} {1}: stage={2}, istage={3}, turnout={4}, hasEmpty={5}, fill={6:F3}, fade={7:F3}, I={8:F3}, alphaI={9:F3}, base={10:F3}, peak={11:F3}, hue={12:F1}",
+                    i,
+                    Path.GetFileName(path),
+                    result.Stage,
+                    result.InternalStage,
+                    result.Turnout,
+                    result.HasEmpty,
+                    result.FillRatio,
+                    result.FadeRatio,
+                    result.Intensity,
+                    result.IntensityAlpha,
+                    result.Baseline,
+                    result.Peak,
+                    result.HueCenter);
+
+                lastStage = result.Stage;
+                lastTurnout = result.Turnout;
+                lastResult = result;
+                hasResult = true;
+            }
+
+            if (hasResult)
+            {
+                Console.WriteLine();
+                Console.WriteLine(
+                    "Final state: stage={0}, turnout={1}, fill={2:F3}, fade={3:F3}, I={4:F3}, base={5:F3}, peak={6:F3}, hue={7:F1}",
+                    lastResult.Stage,
+                    lastResult.Turnout,
+                    lastResult.FillRatio,
+                    lastResult.FadeRatio,
+                    lastResult.Intensity,
+                    lastResult.Baseline,
+                    lastResult.Peak,
+                    lastResult.HueCenter);
             }
         }
 

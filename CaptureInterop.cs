@@ -37,10 +37,12 @@ namespace SkillbarCapture
         [DllImport("user32.dll")]
         private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
 
-        [DllImport("user32.dll")]
-        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-
         private const uint MONITOR_DEFAULTTONEAREST = 2;
+
+        // DWM 扩展边界（去掉阴影）
+        private const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out RECT pvAttribute, int cbAttribute);
 
         [StructLayout(LayoutKind.Sequential)]
         private struct RECT
@@ -132,8 +134,10 @@ namespace SkillbarCapture
                 targetOutput.Dispose();
             }
 
-            if (!GetWindowRect(hwnd, out RECT rect))
-                throw new InvalidOperationException("GetWindowRect failed.");
+            // 强制使用 DWM 扩展边界（去掉阴影），失败直接抛异常
+            int hr = DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, out RECT rect, Marshal.SizeOf<RECT>());
+            if (hr != 0)
+                throw new InvalidOperationException($"DwmGetWindowAttribute failed, hr=0x{hr:X}");
 
             windowRect = new Rectangle(rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top);
         }

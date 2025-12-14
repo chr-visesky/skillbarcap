@@ -271,9 +271,9 @@ namespace SkillbarCapture
 
             castBox = ClampRect(
                 (int)Math.Floor(cx - castW / 2.0),
-                (int)Math.Floor(castTop + yoff),
+                (int)Math.Floor(castTop + yoff - 1), // 向上抬 1px，高度随之 +1
                 (int)Math.Ceiling(cx + castW / 2.0),
-                (int)Math.Ceiling(castBottom + yoff),
+                (int)Math.Ceiling(castBottom + yoff + 1), // 右下角再下移 1px
                 imgW, imgH);
         }
 

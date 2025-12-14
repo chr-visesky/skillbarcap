@@ -32,6 +32,18 @@ namespace SkillbarCapture
                 return;
             }
 
+            if (args[0].Equals("fullshot", StringComparison.OrdinalIgnoreCase))
+            {
+                FullCaptureCommand.Run(args);
+                return;
+            }
+
+            if (args[0].Equals("phase", StringComparison.OrdinalIgnoreCase))
+            {
+                OfflineCommands.RunAnalyzeCastbarPhase(args);
+                return;
+            }
+
             await OnlineCaptureCommand.RunAsync(args);
         }
     }
