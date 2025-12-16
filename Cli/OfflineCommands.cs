@@ -143,7 +143,7 @@ namespace SkillbarCapture
                 var result = detector.Analyze(mat);
 
                 Console.WriteLine(
-                    "{0:D4} {1}: stage={2}, istage={3}, turnout={4}, hasEmpty={5}, fill={6:F3}, fade={7:F3}, I={8:F3}, alphaI={9:F3}, base={10:F3}, peak={11:F3}, hue={12:F1}",
+                    "{0:D4} {1}: stage={2}, istage={3}, turnout={4}, hasEmpty={5}, fill={6:F3}, fade={7:F3}, sparkIdx={8}, I={9:F3}, alphaI={10:F3}, base={11:F3}, peak={12:F3}, hue={13:F1}",
                     i,
                     Path.GetFileName(path),
                     result.Stage,
@@ -152,6 +152,7 @@ namespace SkillbarCapture
                     result.HasEmpty,
                     result.FillRatio,
                     result.FadeRatio,
+                    result.RightCapCutX,
                     result.Intensity,
                     result.IntensityAlpha,
                     result.Baseline,
